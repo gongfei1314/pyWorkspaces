@@ -1,68 +1,83 @@
 # coding:gbk
 '''
-日内做T策略 —— ETF 588170
-底仓: 57700股
+Intraday T+0 Strategy for ETF 588170.SH
+Base holding: 57700 shares
 
-买卖规则（低买高卖）:
-  规则2.1: 股价高于开盘+3%后，触发监控，持续记录最高点；
-          当股价从最高点下滑1%后，卖出20000股。
-  规则2.2: 股价低于开盘-3%后，触发监控，持续记录最低点；
-          当股价从最低点上涨1%后，买入20000股。
-  规则2.3: 卖出20000股后，记录卖出价；若股价继续下滑2.8%，
-          触发监控，持续记录最低点；当股价从最低点上涨0.8%后，买回20000股。
-  规则2.4: 买入20000股后，记录买入价；若股价继续上涨2.8%，
-          触发监控，持续记录最高点；当股价从最高点下滑0.8%后，卖出20000股。
-  规则3:   14:50检查持仓，若不等于底仓57700股，挂单恢复到底仓。
+Trading Rules (buy low, sell high):
+  Rule 2.1: Price >= open+3%, track peak; pullback 1% from peak -> sell 20000
+  Rule 2.2: Price <= open-3%, track trough; bounce 1% from trough -> buy 20000
+  Rule 2.3: After sell, if price drops 2.8% from sell price,
+            track trough; bounce 0.8% -> buy 20000
+  Rule 2.4: After buy, if price rises 2.8% from buy price,
+            track peak; pullback 0.8% -> sell 20000
+  Rule 3:   14:50 rebalance to base holding 57700
+
+Fixes & Improvements:
+  [Bug1] do_buy/do_sell return True/False; state advances only on success
+  [Bug2] do_buy checks available funds before ordering
+  [Bug3] Peak/trough tracked with intrabar high/low (more accurate)
+  [Bug4] Robust holding key lookup via get_holding_amount()
+  [Imp1] Max 2 complete trade cycles per day (4 individual trades)
+  [Imp2] Silent tracking from market open; trade execution starts at 09:50
 '''
 
 # ============================================================
-# 状态枚举
+# State Enum
 # ============================================================
-STATE_IDLE               = 'IDLE'                # 空闲，等待涨3%或跌3%触发
-STATE_TRACKING_HIGH      = 'TRACKING_HIGH'       # 涨过3%，正在追踪最高点
-STATE_TRACKING_LOW       = 'TRACKING_LOW'        # 跌过3%，正在追踪最低点
-STATE_SOLD_TRACKING_LOW  = 'SOLD_TRACKING_LOW'   # 卖出后等继续跌2.8%，追踪最低点等买回
-STATE_BOUGHT_TRACKING_HIGH = 'BOUGHT_TRACKING_HIGH'  # 买入后等继续涨2.8%，追踪最高点等卖出
+STATE_IDLE                 = 'IDLE'                 # Waiting for +/-3%
+STATE_TRACKING_HIGH        = 'TRACKING_HIGH'        # Above +3%, tracking peak
+STATE_TRACKING_LOW         = 'TRACKING_LOW'         # Below -3%, tracking trough
+STATE_SOLD_TRACKING_LOW    = 'SOLD_TRACKING_LOW'    # Sold, tracking trough
+STATE_BOUGHT_TRACKING_HIGH = 'BOUGHT_TRACKING_HIGH' # Bought, tracking peak
 
 
 def init(ContextInfo):
-    # ---- 策略参数 ----
-    ContextInfo.LOTS          = 20000          # 每次做T的股数
-    ContextInfo.BASE_HOLDING  = 57700          # 底仓数量
-    ContextInfo.TARGET_CODE   = '588170.SH'    # ETF代码
+    # ---- Strategy Parameters ----
+    ContextInfo.LOTS          = 20000           # Shares per T operation
+    ContextInfo.BASE_HOLDING  = 57700           # Base position
+    ContextInfo.TARGET_CODE   = '588170.SH'     # ETF code
     ContextInfo.accountID     = 'testS'
 
-    # ---- 触发阈值 ----
-    ContextInfo.UP_TRIGGER      = 0.03         # 开盘+3%触发追踪高点
-    ContextInfo.DOWN_TRIGGER    = 0.03         # 开盘-3%触发追踪低点
-    ContextInfo.SELL_PULLBACK   = 0.01         # 规则2.1: 从最高点回落1%卖出
-    ContextInfo.BUY_BOUNCE      = 0.01         # 规则2.2: 从最低点反弹1%买入
-    ContextInfo.SELL_CONTINUE   = 0.028        # 规则2.3: 卖出后继续跌2.8%触发追踪
-    ContextInfo.REBUY_BOUNCE    = 0.008        # 规则2.3: 从最低点反弹0.8%买回
-    ContextInfo.BUY_CONTINUE    = 0.028        # 规则2.4: 买入后继续涨2.8%触发追踪
-    ContextInfo.RESELL_PULLBACK = 0.008        # 规则2.4: 从最高点下滑0.8%卖出
+    # ---- Thresholds ----
+    ContextInfo.UP_TRIGGER      = 0.03           # +3% trigger
+    ContextInfo.DOWN_TRIGGER    = 0.03           # -3% trigger
+    ContextInfo.SELL_PULLBACK   = 0.01           # Rule 2.1: 1% pullback to sell
+    ContextInfo.BUY_BOUNCE      = 0.01           # Rule 2.2: 1% bounce to buy
+    ContextInfo.SELL_CONTINUE   = 0.028          # Rule 2.3: 2.8% continue drop
+    ContextInfo.REBUY_BOUNCE    = 0.008          # Rule 2.3: 0.8% bounce to rebuy
+    ContextInfo.BUY_CONTINUE    = 0.028          # Rule 2.4: 2.8% continue rise
+    ContextInfo.RESELL_PULLBACK = 0.008          # Rule 2.4: 0.8% pullback to resell
 
-    # ---- 状态变量 ----
+    # ---- Trade Limits ----
+    ContextInfo.MAX_TRADES      = 4              # 2 cycles x (1 buy + 1 sell)
+    ContextInfo.START_TIME      = 950            # 09:50 activation
+    ContextInfo.REBALANCE_TIME  = 1450           # 14:50 rebalance
+
+    # ---- State Variables ----
     ContextInfo.state           = STATE_IDLE
-    ContextInfo.open_price      = 0.0          # 今日开盘价
-    ContextInfo.peak_price      = 0.0          # 记录的最高点
-    ContextInfo.trough_price    = 0.0          # 记录的最低点
-    ContextInfo.sell_price      = 0.0          # 最近一次卖出价（规则2.3用）
-    ContextInfo.buy_price       = 0.0          # 最近一次买入价（规则2.4用）
-    ContextInfo.open_recorded   = False        # 是否已记录今日开盘价
+    ContextInfo.open_price      = 0.0
+    ContextInfo.peak_price      = 0.0
+    ContextInfo.trough_price    = 0.0
+    ContextInfo.sell_price      = 0.0
+    ContextInfo.buy_price       = 0.0
+    ContextInfo.open_recorded   = False
+    ContextInfo.trade_count     = 0              # Individual trades today
+    ContextInfo.intraday_high   = 0.0            # Day high (silent tracking)
+    ContextInfo.intraday_low    = 0.0            # Day low (silent tracking)
 
     ContextInfo.set_universe([ContextInfo.TARGET_CODE])
 
 
 def handlebar(ContextInfo):
-    # ---- 获取当前K线时间 ----
+    # ---- Get current bar time ----
     d = ContextInfo.barpos
     date = timetag_to_datetime(ContextInfo.get_bar_timetag(d), '%Y-%m-%d %H:%M:%S')
-    hhmm = int(date[11:13] + date[14:16])      # 如 0930, 1450
+    hhmm = int(date[11:13] + date[14:16])        # e.g. 0930, 1450
 
-    print('运行时间:', date, '| 状态:', ContextInfo.state)
+    print('Time:', date, '| State:', ContextInfo.state,
+          '| Trades:', ContextInfo.trade_count, '/', ContextInfo.MAX_TRADES)
 
-    # ---- 获取最新行情 ----
+    # ---- Get market data ----
     df = ContextInfo.get_market_data(
         ['open', 'high', 'low', 'close'],
         stock_code=ContextInfo.get_universe(),
@@ -73,204 +88,280 @@ def handlebar(ContextInfo):
     if df.empty:
         return
 
-    current_price = df.iloc[-1]['close']
-    if current_price <= 0:
+    current_close = df.iloc[-1]['close']
+    current_high  = df.iloc[-1]['high']          # [Bug3] use intrabar high
+    current_low   = df.iloc[-1]['low']           # [Bug3] use intrabar low
+    if current_close <= 0 or current_high <= 0 or current_low <= 0:
         return
 
     # ============================================================
-    # 第一步：记录今日开盘价（只在第一根K线记录一次）
+    # Step 1: Record open price (first bar only)
     # ============================================================
     if not ContextInfo.open_recorded:
         ContextInfo.open_price = df.iloc[-1]['open']
         ContextInfo.open_recorded = True
-        print('今日开盘价:', ContextInfo.open_price)
+        print('Open price recorded:', ContextInfo.open_price)
 
     open_price = ContextInfo.open_price
     if open_price <= 0:
         return
 
-    change_ratio = (current_price - open_price) / open_price   # 相对开盘的涨跌幅
+    change_ratio = (current_close - open_price) / open_price
 
     # ============================================================
-    # 第二步：14:50 尾盘归位检查（规则3）
+    # Step 2: 14:50 rebalance (Rule 3) -- always runs
     # ============================================================
-    if hhmm >= 1450:
-        rebalance_position(ContextInfo, current_price, date)
+    if hhmm >= ContextInfo.REBALANCE_TIME:
+        rebalance_position(ContextInfo, current_close, date)
         return
 
     # ============================================================
-    # 第三步：主体状态机 —— 日内做T逻辑
+    # Step 3: Determine if trading is allowed [Imp2: silent tracking]
+    #   Before 09:50: track peaks/troughs but DO NOT trade
+    #   After  09:50: trade normally with accurate peak/trough data
+    # ============================================================
+    can_trade = (hhmm >= ContextInfo.START_TIME)
+    if not can_trade:
+        print('[SILENT] Before 09:50, tracking only. change: %.2f%%' % (change_ratio * 100))
+
+    # ============================================================
+    # Step 4: Max trades reached -- stop trading [Imp1]
+    #   (still allow peak/trough tracking)
+    # ============================================================
+    max_reached = (ContextInfo.trade_count >= ContextInfo.MAX_TRADES)
+    if max_reached and can_trade:
+        print('Max trades (%d) reached, waiting for 14:50 rebalance' % ContextInfo.MAX_TRADES)
+        return
+
+    # ============================================================
+    # Step 5: State machine -- core T+0 logic
+    #   - IDLE: always tracks intraday high/low; enters tracking
+    #           states only after 09:50 with accurate peak/trough
+    #   - Other states: only reachable after 09:50 (via trade)
     # ============================================================
     state = ContextInfo.state
 
     # ----------------------------------------------------------
-    # 状态: IDLE —— 等待涨3%或跌3%触发
+    # IDLE: wait for +/-3% trigger
+    #   Always track intraday high/low for later use
+    #   Only enter tracking states after 09:50
     # ----------------------------------------------------------
     if state == STATE_IDLE:
-        if change_ratio >= ContextInfo.UP_TRIGGER:
-            # 规则2.1入口: 涨幅达到+3%，开始追踪最高点
-            ContextInfo.state = STATE_TRACKING_HIGH
-            ContextInfo.peak_price = current_price
-            print('触发: 涨幅>=+3%, 开始追踪最高点. 当前价:', current_price)
+        # Silent tracking: record intraday extremes (always)
+        if current_high > ContextInfo.intraday_high:
+            ContextInfo.intraday_high = current_high
+        if ContextInfo.intraday_low <= 0 or current_low < ContextInfo.intraday_low:
+            ContextInfo.intraday_low = current_low
 
-        elif change_ratio <= -ContextInfo.DOWN_TRIGGER:
-            # 规则2.2入口: 跌幅达到-3%，开始追踪最低点
+        # Only enter tracking states when trading is allowed
+        if can_trade and change_ratio >= ContextInfo.UP_TRIGGER:
+            ContextInfo.state = STATE_TRACKING_HIGH
+            # Use accurate intraday high as initial peak
+            ContextInfo.peak_price = max(ContextInfo.intraday_high, current_high)
+            print('TRIGGER UP: change >= +3%. Peak (with intraday):', ContextInfo.peak_price)
+
+        elif can_trade and change_ratio <= -ContextInfo.DOWN_TRIGGER:
             ContextInfo.state = STATE_TRACKING_LOW
-            ContextInfo.trough_price = current_price
-            print('触发: 跌幅<=-3%, 开始追踪最低点. 当前价:', current_price)
+            # Use accurate intraday low as initial trough
+            ContextInfo.trough_price = min(ContextInfo.intraday_low, current_low)
+            print('TRIGGER DOWN: change <= -3%. Trough (with intraday):', ContextInfo.trough_price)
 
     # ----------------------------------------------------------
-    # 状态: TRACKING_HIGH —— 规则2.1: 追踪最高点，回落1%则卖出
+    # TRACKING_HIGH: Rule 2.1 -- track peak, sell on 1% pullback
     # ----------------------------------------------------------
     elif state == STATE_TRACKING_HIGH:
-        if current_price > ContextInfo.peak_price:
-            ContextInfo.peak_price = current_price      # 不断更新最高点
-            print('更新最高点:', ContextInfo.peak_price)
+        if current_high > ContextInfo.peak_price:
+            ContextInfo.peak_price = current_high    # [Bug3] update with high
+            print('New peak:', ContextInfo.peak_price)
 
-        pullback = (ContextInfo.peak_price - current_price) / ContextInfo.peak_price
+        pullback = (ContextInfo.peak_price - current_close) / ContextInfo.peak_price
         if pullback >= ContextInfo.SELL_PULLBACK:
-            # 从最高点回落1%，执行卖出
-            do_sell(ContextInfo, ContextInfo.LOTS, current_price, date)
-            ContextInfo.sell_price = current_price
-            ContextInfo.state = STATE_SOLD_TRACKING_LOW
-            ContextInfo.trough_price = current_price    # 开始追踪卖出后的最低点
-            print('卖出信号(规则2.1): 从最高点回落1%. 卖出价:', current_price, '| 转入卖出后追踪')
+            if do_sell(ContextInfo, ContextInfo.LOTS, current_close, date):
+                ContextInfo.sell_price = current_close
+                ContextInfo.state = STATE_SOLD_TRACKING_LOW
+                ContextInfo.trough_price = current_low
+                ContextInfo.trade_count += 1
+                print('SELL (Rule 2.1): pullback %.2f%% from peak. Price: %.3f' %
+                      (pullback * 100, current_close))
 
     # ----------------------------------------------------------
-    # 状态: TRACKING_LOW —— 规则2.2: 追踪最低点，反弹1%则买入
+    # TRACKING_LOW: Rule 2.2 -- track trough, buy on 1% bounce
     # ----------------------------------------------------------
     elif state == STATE_TRACKING_LOW:
-        if current_price < ContextInfo.trough_price:
-            ContextInfo.trough_price = current_price    # 不断更新最低点
-            print('更新最低点:', ContextInfo.trough_price)
+        if 0 < current_low < ContextInfo.trough_price:
+            ContextInfo.trough_price = current_low   # [Bug3] update with low
+            print('New trough:', ContextInfo.trough_price)
 
-        bounce = (current_price - ContextInfo.trough_price) / ContextInfo.trough_price
+        bounce = (current_close - ContextInfo.trough_price) / ContextInfo.trough_price
         if bounce >= ContextInfo.BUY_BOUNCE:
-            # 从最低点反弹1%，执行买入
-            do_buy(ContextInfo, ContextInfo.LOTS, current_price, date)
-            ContextInfo.buy_price = current_price
-            ContextInfo.state = STATE_BOUGHT_TRACKING_HIGH
-            ContextInfo.peak_price = current_price      # 开始追踪买入后的最高点
-            print('买入信号(规则2.2): 从最低点反弹1%. 买入价:', current_price, '| 转入买入后追踪')
+            if do_buy(ContextInfo, ContextInfo.LOTS, current_close, date):
+                ContextInfo.buy_price = current_close
+                ContextInfo.state = STATE_BOUGHT_TRACKING_HIGH
+                ContextInfo.peak_price = current_high
+                ContextInfo.trade_count += 1
+                print('BUY (Rule 2.2): bounce %.2f%% from trough. Price: %.3f' %
+                      (bounce * 100, current_close))
 
     # ----------------------------------------------------------
-    # 状态: SOLD_TRACKING_LOW —— 规则2.3: 卖出后等继续跌2.8%，
-    #        然后追踪最低点，反弹0.8%则买回
+    # SOLD_TRACKING_LOW: Rule 2.3 -- wait 2.8% drop, buy on 0.8% bounce
+    #                    Also: breakeven protection if price >= sell_price
     # ----------------------------------------------------------
     elif state == STATE_SOLD_TRACKING_LOW:
-        # 不断更新卖出后的最低点
-        if current_price < ContextInfo.trough_price:
-            ContextInfo.trough_price = current_price
-            print('卖出后更新最低点:', ContextInfo.trough_price)
+        if 0 < current_low < ContextInfo.trough_price:
+            ContextInfo.trough_price = current_low
+            print('New trough (post-sell):', ContextInfo.trough_price)
 
-        # 检查是否已从卖出价继续下跌了2.8%
-        drop_from_sell = (ContextInfo.sell_price - current_price) / ContextInfo.sell_price
+        drop_from_sell = (ContextInfo.sell_price - current_close) / ContextInfo.sell_price
 
         if drop_from_sell >= ContextInfo.SELL_CONTINUE:
-            # 继续跌了2.8%以后，用0.8%反弹条件判断买回
-            bounce_from_low = (current_price - ContextInfo.trough_price) / ContextInfo.trough_price
+            # Price dropped 2.8%+ from sell price, now watch for 0.8% bounce
+            bounce_from_low = (current_close - ContextInfo.trough_price) / ContextInfo.trough_price
             if bounce_from_low >= ContextInfo.REBUY_BOUNCE:
-                # 从最低点反弹0.8%，买回20000股
-                do_buy(ContextInfo, ContextInfo.LOTS, current_price, date)
-                ContextInfo.buy_price = current_price
-                ContextInfo.state = STATE_BOUGHT_TRACKING_HIGH
-                ContextInfo.peak_price = current_price  # 开始追踪买入后的最高点
-                print('买回信号(规则2.3): 卖出后继续跌2.8%+, 从最低点反弹0.8%. 买回价:', current_price, '| 转入买入后追踪')
+                if do_buy(ContextInfo, ContextInfo.LOTS, current_close, date):
+                    ContextInfo.buy_price = current_close
+                    ContextInfo.state = STATE_BOUGHT_TRACKING_HIGH
+                    ContextInfo.peak_price = current_high
+                    ContextInfo.trade_count += 1
+                    print('BUY (Rule 2.3): dropped 2.8%%+, bounced 0.8%%. Price: %.3f' % current_close)
 
-        # 踏空保护：卖出后没继续跌2.8%而是直接涨回卖出价上方，买回防止踏空
-        elif current_price >= ContextInfo.sell_price:
-            do_buy(ContextInfo, ContextInfo.LOTS, current_price, date)
-            ContextInfo.buy_price = current_price
-            ContextInfo.state = STATE_BOUGHT_TRACKING_HIGH
-            ContextInfo.peak_price = current_price
-            print('买回信号(踏空保护): 股价回到卖出价上方. 买回价:', current_price, '| 转入买入后追踪')
+        elif current_close >= ContextInfo.sell_price:
+            # Breakeven protection: price recovered above sell price
+            if do_buy(ContextInfo, ContextInfo.LOTS, current_close, date):
+                ContextInfo.buy_price = current_close
+                ContextInfo.state = STATE_BOUGHT_TRACKING_HIGH
+                ContextInfo.peak_price = current_high
+                ContextInfo.trade_count += 1
+                print('BUY (breakeven): price back above sell price. Price: %.3f' % current_close)
 
     # ----------------------------------------------------------
-    # 状态: BOUGHT_TRACKING_HIGH —— 规则2.4: 买入后等继续涨2.8%，
-    #        然后追踪最高点，下滑0.8%则卖出
+    # BOUGHT_TRACKING_HIGH: Rule 2.4 -- wait 2.8% rise, sell on 0.8% pullback
+    #                       Also: stop-loss if price <= buy_price
     # ----------------------------------------------------------
     elif state == STATE_BOUGHT_TRACKING_HIGH:
-        # 不断更新买入后的最高点
-        if current_price > ContextInfo.peak_price:
-            ContextInfo.peak_price = current_price
-            print('买入后更新最高点:', ContextInfo.peak_price)
+        if current_high > ContextInfo.peak_price:
+            ContextInfo.peak_price = current_high
+            print('New peak (post-buy):', ContextInfo.peak_price)
 
-        # 检查是否已从买入价继续上涨了2.8%
-        rise_from_buy = (current_price - ContextInfo.buy_price) / ContextInfo.buy_price
+        rise_from_buy = (current_close - ContextInfo.buy_price) / ContextInfo.buy_price
 
         if rise_from_buy >= ContextInfo.BUY_CONTINUE:
-            # 继续涨了2.8%以后，用0.8%下滑条件判断卖出
-            pullback_from_high = (ContextInfo.peak_price - current_price) / ContextInfo.peak_price
+            # Price risen 2.8%+ from buy price, now watch for 0.8% pullback
+            pullback_from_high = (ContextInfo.peak_price - current_close) / ContextInfo.peak_price
             if pullback_from_high >= ContextInfo.RESELL_PULLBACK:
-                # 从最高点下滑0.8%，卖出20000股
-                do_sell(ContextInfo, ContextInfo.LOTS, current_price, date)
-                ContextInfo.sell_price = current_price
-                ContextInfo.state = STATE_SOLD_TRACKING_LOW
-                ContextInfo.trough_price = current_price  # 开始追踪卖出后的最低点
-                print('卖出信号(规则2.4): 买入后继续涨2.8%+, 从最高点下滑0.8%. 卖出价:', current_price, '| 转入卖出后追踪')
+                if do_sell(ContextInfo, ContextInfo.LOTS, current_close, date):
+                    ContextInfo.sell_price = current_close
+                    ContextInfo.state = STATE_SOLD_TRACKING_LOW
+                    ContextInfo.trough_price = current_low
+                    ContextInfo.trade_count += 1
+                    print('SELL (Rule 2.4): risen 2.8%%+, pulled back 0.8%%. Price: %.3f' % current_close)
 
-        # 止损保护：买入后没继续涨2.8%而是直接跌回买入价下方，卖出防止套牢
-        elif current_price <= ContextInfo.buy_price:
-            do_sell(ContextInfo, ContextInfo.LOTS, current_price, date)
-            ContextInfo.sell_price = current_price
-            ContextInfo.state = STATE_SOLD_TRACKING_LOW
-            ContextInfo.trough_price = current_price
-            print('卖出信号(止损保护): 股价跌回买入价下方. 卖出价:', current_price, '| 转入卖出后追踪')
+        elif current_close <= ContextInfo.buy_price:
+            # Stop-loss protection: price dropped to/below buy price
+            if do_sell(ContextInfo, ContextInfo.LOTS, current_close, date):
+                ContextInfo.sell_price = current_close
+                ContextInfo.state = STATE_SOLD_TRACKING_LOW
+                ContextInfo.trough_price = current_low
+                ContextInfo.trade_count += 1
+                print('SELL (stop-loss): price dropped below buy price. Price: %.3f' % current_close)
 
 
 # ============================================================
-# 交易执行函数
+# Trade execution functions
 # ============================================================
 def do_buy(ContextInfo, lots, price, date):
-    """买入指定股数"""
+    """
+    Execute buy order.
+    [Bug2] Checks available funds before ordering.
+    Returns True on success, False on failure.
+    """
     code = ContextInfo.get_universe()[0]
+
+    # [Bug2] Check available funds
+    available_funds = get_avaliable(ContextInfo.accountID, 'STOCK')
+    cost = lots * price
+    if available_funds < cost:
+        print('[FAIL BUY] Insufficient funds: need %.2f, available %.2f' % (cost, available_funds))
+        return False
+
     order_shares(code, lots, 'fix', price, ContextInfo, ContextInfo.accountID)
-    print('[%s] 买入 %s  %d股 @ %.3f' % (date, code, lots, price))
+    print('[%s] >>> BUY  %s  %d shares @ %.3f' % (date, code, lots, price))
+    return True
 
 
 def do_sell(ContextInfo, lots, price, date):
-    """卖出指定股数"""
+    """
+    Execute sell order.
+    [Bug1] Returns True on success, False on failure.
+    """
     code = ContextInfo.get_universe()[0]
     holding = get_holdings(ContextInfo.accountID, 'STOCK')
-    available = holding.get(code, 0)
+    available = get_holding_amount(holding, code)    # [Bug4] robust lookup
+
     if available < lots:
         lots = available
-        print('可用持仓不足，调整为:', lots)
+        print('Available holdings insufficient, adjusted to:', lots)
     if lots <= 0:
-        print('无可用持仓可卖')
-        return
+        print('[FAIL SELL] No available holdings to sell')
+        return False
+
     order_shares(code, -lots, 'fix', price, ContextInfo, ContextInfo.accountID)
-    print('[%s] 卖出 %s  %d股 @ %.3f' % (date, code, lots, price))
+    print('[%s] >>> SELL %s  %d shares @ %.3f' % (date, code, lots, price))
+    return True
 
 
 def rebalance_position(ContextInfo, current_price, date):
-    """
-    14:50 检查持仓，恢复到底仓57700股
-    """
+    """14:50 rebalance to restore base holding."""
     code = ContextInfo.get_universe()[0]
     holding = get_holdings(ContextInfo.accountID, 'STOCK')
-    current_holding = holding.get(code, 0)
+    current_holding = get_holding_amount(holding, code)  # [Bug4] robust lookup
 
     diff = current_holding - ContextInfo.BASE_HOLDING
     if diff == 0:
-        print('[%s] 14:50检查: 持仓=%d, 底仓=%d, 无需调整' % (date, current_holding, ContextInfo.BASE_HOLDING))
+        print('[%s] 14:50 check: holding=%d, base=%d, balanced' %
+              (date, current_holding, ContextInfo.BASE_HOLDING))
         return
 
     if diff > 0:
-        # 持仓多于底仓，卖出多余
+        # Over base, sell excess
         order_shares(code, -diff, 'fix', current_price, ContextInfo, ContextInfo.accountID)
-        print('[%s] 14:50归位: 卖出%d股, 恢复底仓%d' % (date, diff, ContextInfo.BASE_HOLDING))
+        print('[%s] 14:50 REBALANCE: SELL %d shares, restore to %d' %
+              (date, diff, ContextInfo.BASE_HOLDING))
     else:
-        # 持仓少于底仓，买回缺少
+        # Under base, buy deficit (-diff is positive)
         order_shares(code, -diff, 'fix', current_price, ContextInfo, ContextInfo.accountID)
-        print('[%s] 14:50归位: 买入%d股, 恢复底仓%d' % (date, -diff, ContextInfo.BASE_HOLDING))
+        print('[%s] 14:50 REBALANCE: BUY %d shares, restore to %d' %
+              (date, -diff, ContextInfo.BASE_HOLDING))
 
 
 # ============================================================
-# 辅助函数 —— 查询账户信息
+# Utility functions
 # ============================================================
+def get_holding_amount(holding_dict, code):
+    """
+    [Bug4] Get holding amount from dict.
+    Compatible with multiple key formats:
+      '588170.SH', '588170.SHSE', '588170.SSE', '588170', etc.
+    """
+    # 1) Direct match
+    if code in holding_dict:
+        return holding_dict[code]
+
+    # 2) Fuzzy match by instrument number
+    code_num = code.split('.')[0]
+    for key, val in holding_dict.items():
+        if key.split('.')[0] == code_num:
+            return val
+
+    # 3) Substring match as last resort
+    for key, val in holding_dict.items():
+        if code_num in key:
+            return val
+
+    return 0
+
+
 def get_avaliable(accountid, datatype):
-    """查询可用资金"""
+    """Query available cash."""
     result = 0
     resultlist = get_trade_detail_data(accountid, datatype, "ACCOUNT")
     for obj in resultlist:
@@ -279,7 +370,7 @@ def get_avaliable(accountid, datatype):
 
 
 def get_holdings(accountid, datatype):
-    """查询持仓字典 {code: 可用数量}"""
+    """Query holdings. Returns {code: available_volume}."""
     holdinglist = {}
     resultlist = get_trade_detail_data(accountid, datatype, "POSITION")
     for obj in resultlist:
