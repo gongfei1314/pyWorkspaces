@@ -47,6 +47,7 @@ def init(ContextInfo):
     ContextInfo.REBUY_BOUNCE    = 0.008          # 规则2.3: 反弹0.8%回补
     ContextInfo.BUY_CONTINUE    = 0.028          # 规则2.4: 继续上涨2.8%触发
     ContextInfo.RESELL_PULLBACK = 0.008          # 规则2.4: 回撤0.8%再卖
+    ContextInfo.PROTECTION_BUF  = 0.005          # 止损/平价保护缓冲阈值0.5%
 
     # ---- 交易限制 ----
     ContextInfo.MAX_TRADES      = 4              # 最多2次循环 × (1买+1卖) = 4笔
@@ -224,8 +225,8 @@ def handlebar(ContextInfo):
                     ContextInfo.trade_count += 1
                     print('买入(规则2.3): 跌2.8%%+后反弹0.8%%. 买回价: %.3f' % current_close)
 
-        elif current_close >= ContextInfo.sell_price:
-            # 平价保护: 股价涨回卖出价上方, 买回避免踏空
+        elif current_close >= ContextInfo.sell_price * (1 + ContextInfo.PROTECTION_BUF):
+            # 平价保护: 股价涨超卖出价+0.5%, 买回避免踏空
             if do_buy(ContextInfo, ContextInfo.LOTS, current_close, date):
                 ContextInfo.buy_price = current_close
                 ContextInfo.state = STATE_BOUGHT_TRACKING_HIGH
@@ -255,8 +256,8 @@ def handlebar(ContextInfo):
                     ContextInfo.trade_count += 1
                     print('卖出(规则2.4): 涨2.8%%+后回撤0.8%%. 卖出价: %.3f' % current_close)
 
-        elif current_close <= ContextInfo.buy_price:
-            # 止损保护: 股价跌回买入价下方, 卖出避免套牢
+        elif current_close <= ContextInfo.buy_price * (1 - ContextInfo.PROTECTION_BUF):
+            # 止损保护: 股价跌破买入价-0.5%, 卖出避免套牢
             if do_sell(ContextInfo, ContextInfo.LOTS, current_close, date):
                 ContextInfo.sell_price = current_close
                 ContextInfo.state = STATE_SOLD_TRACKING_LOW
