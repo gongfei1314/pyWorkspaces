@@ -450,5 +450,5 @@ def get_holdings(accountid, datatype):
     holdinglist = {}
     resultlist = get_trade_detail_data(accountid, datatype, "POSITION")
     for obj in resultlist:
-        holdinglist[obj.m_strInstrumentID + "." + obj.m_strExchangeID] = obj.m_nCanUseVolume
+        holdinglist[obj.m_strInstrumentID + "." + obj.m_strExchangeID] = obj.m_nVolume
     return holdinglist
