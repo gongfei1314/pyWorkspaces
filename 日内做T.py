@@ -53,6 +53,7 @@ def init(ContextInfo):
     ContextInfo.MAX_TRADES      = 4              # 最多2次循环 × (1买+1卖) = 4笔
     ContextInfo.START_TIME      = 950            # 09:50 策略激活
     ContextInfo.REBALANCE_TIME  = 1450           # 14:50 尾盘平仓
+    ContextInfo.STOP_FLAT_TIME   = 1411           # 14:11 后持仓=底仓, 停止当日交易
 
     # ---- 状态变量 ----
     ContextInfo.state           = STATE_IDLE
@@ -179,6 +180,11 @@ def handlebar(ContextInfo):
     max_reached = (ContextInfo.trade_count >= ContextInfo.MAX_TRADES)
     if max_reached and can_trade:
         print('已达最大交易笔数(%d), 等待14:50平仓' % ContextInfo.MAX_TRADES)
+        return
+
+    # ---- 14:11 后持仓已平, 停止当日交易 ----
+    if can_trade and hhmm >= ContextInfo.STOP_FLAT_TIME and ContextInfo.current_holding == ContextInfo.BASE_HOLDING:
+        print('[%s] 14:11 后持仓已平, 停止当日交易' % date)
         return
 
     # ============================================================
