@@ -41,8 +41,8 @@ def init(ContextInfo):
     # ---- 阈值参数 ----
     ContextInfo.UP_TRIGGER      = 0.03           # 冲高+3%触发
     ContextInfo.DOWN_TRIGGER    = 0.03           # 回落-3%触发
-    ContextInfo.SELL_PULLBACK   = 0.01           # 规则2.1: 回撤1%卖出
-    ContextInfo.BUY_BOUNCE      = 0.01           # 规则2.2: 反弹1%买入
+    ContextInfo.SELL_PULLBACK   = 0.012           # 规则2.1: 回撤1%卖出
+    ContextInfo.BUY_BOUNCE      = 0.012           # 规则2.2: 反弹1%买入
     ContextInfo.SELL_CONTINUE   = 0.02          # 规则2.3: 继续下跌2%触发
     ContextInfo.REBUY_BOUNCE    = 0.005          # 规则2.3: 反弹0.8%回补
     ContextInfo.BUY_CONTINUE    = 0.02          # 规则2.4: 继续上涨2%触发
@@ -71,6 +71,8 @@ def init(ContextInfo):
     ContextInfo.rebalanced = False                         # 尾盘平仓是否已执行
     ContextInfo.sell_drop_achieved = False                 # Rule 2.3: sell price dropped 2% from sell_price
     ContextInfo.buy_rise_achieved = False                  # Rule 2.4: buy price risen 2% from buy_price
+    ContextInfo.prev_close      = 0.0            # 前一日收盘价(昨收价), 触发参考价
+    ContextInfo.last_bar_close  = 0.0            # 上一根K线收盘(跨日传递昨收)
 
     ContextInfo.set_universe([ContextInfo.TARGET_CODE])
 
@@ -108,6 +110,7 @@ def handlebar(ContextInfo):
     # ============================================================
     current_date = date[:10]
     if ContextInfo.last_trade_date != current_date:
+        ContextInfo.prev_close = ContextInfo.last_bar_close
         if ContextInfo.last_trade_date != '':
             print('========== 新交易日 %s: 状态重置 ==========' % current_date)
         ContextInfo.last_trade_date = current_date
@@ -125,10 +128,12 @@ def handlebar(ContextInfo):
         ContextInfo.sell_drop_achieved = False
         ContextInfo.buy_rise_achieved = False
 
+    ContextInfo.last_bar_close = current_close
+
     if not ContextInfo.open_recorded:
         ContextInfo.open_price = df.iloc[-1]['open']
         ContextInfo.open_recorded = True
-        print('当日开盘价:', ContextInfo.open_price)
+        print('当日开盘价:', ContextInfo.open_price, '| 昨收价:', ContextInfo.prev_close)
 
         # 底仓处理: 实盘已有持仓则跳过，回测/模拟则买入
         if not ContextInfo.base_bought:
@@ -148,7 +153,8 @@ def handlebar(ContextInfo):
     if open_price <= 0:
         return
 
-    change_ratio = (current_close - open_price) / open_price   # 相对开盘涨跌幅
+    ref_price = ContextInfo.prev_close if ContextInfo.prev_close > 0 else open_price
+    change_ratio = (current_close - ref_price) / ref_price   # 相对昨收价的涨跌幅
 
     # ============================================================
     # 第二步: 14:50 尾盘平仓（规则3，始终执行）
