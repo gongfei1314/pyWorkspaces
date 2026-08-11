@@ -43,10 +43,17 @@ def init(ContextInfo):
     ContextInfo.DOWN_TRIGGER    = 0.03           # 回落-3%触发
     ContextInfo.SELL_PULLBACK   = 0.012           # 规则2.1: 回撤1%卖出
     ContextInfo.BUY_BOUNCE      = 0.012           # 规则2.2: 反弹1%买入
-    ContextInfo.SELL_CONTINUE   = 0.02          # 规则2.3: 继续下跌2%触发
-    ContextInfo.REBUY_BOUNCE    = 0.005          # 规则2.3: 反弹0.8%回补
-    ContextInfo.BUY_CONTINUE    = 0.02          # 规则2.4: 继续上涨2%触发
-    ContextInfo.RESELL_PULLBACK = 0.005          # 规则2.4: 回撤0.8%再卖
+    ContextInfo.SELL_CONTINUE   = 0.02          # 规则2.3: 继续下跌2%触发(旧)
+    ContextInfo.REBUY_BOUNCE    = 0.005          # 规则2.3: 反弹0.5%回补(旧)
+    ContextInfo.BUY_CONTINUE    = 0.02          # 规则2.4: 继续上涨2%触发(旧)
+    ContextInfo.RESELL_PULLBACK = 0.005          # 规则2.4: 回调0.5%再卖(旧)
+    ContextInfo.SELL_TRACK_TRIGGER = 0.015          # 规则2.3: 触发阈值(跌1.5%)
+    ContextInfo.BUY_TRACK_TRIGGER  = 0.015          # 规则2.4: 触发阈值(涨1.5%)
+    ContextInfo.REBUY_THRESH       = 0.004          # 规则2.3: 回补阈值(反弹0.4%)
+    ContextInfo.RESELL_THRESH      = 0.004          # 规则2.4: 再卖阈值(回调0.4%)
+    ContextInfo.SELL_CONTINUE_ALT  = 0.006        # 规则2.3: 备选触发(0.6%+10分钟)
+    ContextInfo.BUY_CONTINUE_ALT   = 0.006        # 规则2.4: 备选触发(0.6%+10分钟)
+    ContextInfo.CONTINUE_WAIT_BARS = 10           # 备选触发需等待K线数(10分钟)
     ContextInfo.PROTECTION_BUF  = 0.003          # 止损/平价保护缓冲阈值0.5%
 
     # ---- 交易限制 ----
@@ -74,6 +81,8 @@ def init(ContextInfo):
     ContextInfo.buy_rise_achieved = False                  # Rule 2.4: buy price risen 2% from buy_price
     ContextInfo.prev_close      = 0.0            # 前一日收盘价(昨收价), 触发参考价
     ContextInfo.last_bar_close  = 0.0            # 上一根K线收盘(跨日传递昨收)
+    ContextInfo.bars_since_sell = 0              # 卖出后经过的K线数
+    ContextInfo.bars_since_buy  = 0              # 买入后经过的K线数
 
     ContextInfo.set_universe([ContextInfo.TARGET_CODE])
 
@@ -234,6 +243,7 @@ def handlebar(ContextInfo):
                 ContextInfo.state = STATE_SOLD_TRACKING_LOW
                 ContextInfo.sell_drop_achieved = False
                 ContextInfo.trough_price = current_low
+                ContextInfo.bars_since_sell = 0
                 ContextInfo.trade_count += 1
                 print('卖出(规则2.1): 从峰值回撤%.2f%%. 卖出价: %.3f' %
                       (pullback * 100, current_close))
@@ -254,47 +264,65 @@ def handlebar(ContextInfo):
                 ContextInfo.state = STATE_BOUGHT_TRACKING_HIGH
                 ContextInfo.buy_rise_achieved = False
                 ContextInfo.peak_price = current_high
+                ContextInfo.bars_since_buy = 0
                 ContextInfo.trade_count += 1
                 print('买入(规则2.2): 从谷值反弹%.2f%%. 买入价: %.3f' %
                       (bounce * 100, current_close))
 
     # ----------------------------------------------------------
-    # SOLD_TRACKING_LOW: 规则2.3 -- 等继续跌2%, 反弹0.8%买入
+    # SOLD_TRACKING_LOW: 规则2.3 -- 触发: 跌1.5% 或 (0.6%+10分钟), 回补: 反弹0.4%
     #                    附加: 平价保护, 股价涨回卖出价上方则买回
     # ----------------------------------------------------------
     elif state == STATE_SOLD_TRACKING_LOW:
+        ContextInfo.bars_since_sell += 1
+
         if 0 < current_low < ContextInfo.trough_price:
             ContextInfo.trough_price = current_low
             print('[rule2.3] update trough:', ContextInfo.trough_price)
 
         drop_from_sell = (ContextInfo.sell_price - current_close) / ContextInfo.sell_price
 
-        # --- Phase 1: Mark flag when 2% drop achieved ---
-        if drop_from_sell >= ContextInfo.SELL_CONTINUE and not ContextInfo.sell_drop_achieved:
-            ContextInfo.sell_drop_achieved = True
-            print('[rule2.3] 2%% drop achieved! Monitoring 0.5%% bounce...')
+        # --- Phase 1: 触发条件 -- 跌1.5% 或 (0.6%且10分钟) ---
+        if not ContextInfo.sell_drop_achieved:
+            if ContextInfo.trade_count >= 3:
+                # 第3笔起: 跌1.5% 或 (0.6%且10分钟)
+                if drop_from_sell >= ContextInfo.SELL_TRACK_TRIGGER:
+                    ContextInfo.sell_drop_achieved = True
+                    print('[rule2.3] 1.5% drop triggered! Monitoring 0.4% bounce...')
+                elif (drop_from_sell >= ContextInfo.SELL_CONTINUE_ALT and
+                      ContextInfo.bars_since_sell >= ContextInfo.CONTINUE_WAIT_BARS):
+                    ContextInfo.sell_drop_achieved = True
+                    print('[rule2.3] 0.6%+10min triggered! Monitoring 0.4% bounce...')
+            else:
+                # 前2笔: 跌2%
+                if drop_from_sell >= ContextInfo.SELL_CONTINUE:
+                    ContextInfo.sell_drop_achieved = True
+                    print('[rule2.3] 2% drop achieved! Monitoring 0.5% bounce...')
 
-        # --- Phase 2a: 2% drop achieved -> check 0.5% bounce (rule 2.3) ---
+        # --- Phase 2a: 触发后 -- 从新底反弹0.4%买入 ---
         if ContextInfo.sell_drop_achieved:
             bounce_from_low = (current_close - ContextInfo.trough_price) / ContextInfo.trough_price
             print('[rule2.3] drop=%.2f%% bounce=%.2f%% trough=%.3f' %
                   (drop_from_sell * 100, bounce_from_low * 100, ContextInfo.trough_price))
-            if bounce_from_low >= ContextInfo.REBUY_BOUNCE:
+            rebuy_thresh = ContextInfo.REBUY_THRESH if ContextInfo.trade_count >= 3 else ContextInfo.REBUY_BOUNCE
+            if bounce_from_low >= rebuy_thresh:
                 if do_buy(ContextInfo, ContextInfo.LOTS, current_close, date):
                     ContextInfo.buy_price = current_close
                     ContextInfo.sell_drop_achieved = False
                     ContextInfo.buy_rise_achieved = False
+                    ContextInfo.bars_since_buy = 0
                     ContextInfo.state = STATE_BOUGHT_TRACKING_HIGH
                     ContextInfo.peak_price = current_high
                     ContextInfo.trade_count += 1
-                    print('[BUY rule2.3] 2%%+bounce0.5%%. rebuy: %.3f' % current_close)
+                    print('[BUY rule2.3] bounce>=%.1f%%. rebuy: %.3f' % (rebuy_thresh * 100, current_close))
 
-        # --- Phase 2b: breakeven protection (only after 3rd trade) ---
+        # --- Phase 2b: 平仓保护 (仅第3笔起) ---
         elif ContextInfo.trade_count >= 3 and current_close >= ContextInfo.sell_price * (1 + ContextInfo.PROTECTION_BUF):
             if do_buy(ContextInfo, ContextInfo.LOTS, current_close, date):
                 ContextInfo.buy_price = current_close
                 ContextInfo.sell_drop_achieved = False
                 ContextInfo.buy_rise_achieved = False
+                ContextInfo.bars_since_buy = 0
                 ContextInfo.state = STATE_BOUGHT_TRACKING_HIGH
                 ContextInfo.peak_price = current_high
                 ContextInfo.trade_count += 1
@@ -302,38 +330,55 @@ def handlebar(ContextInfo):
                       (ContextInfo.trade_count, current_close))
 
     elif state == STATE_BOUGHT_TRACKING_HIGH:
+        ContextInfo.bars_since_buy += 1
+
         if current_high > ContextInfo.peak_price:
             ContextInfo.peak_price = current_high
             print('[rule2.4] update peak:', ContextInfo.peak_price)
 
         rise_from_buy = (current_close - ContextInfo.buy_price) / ContextInfo.buy_price
 
-        # --- Phase 1: Mark flag when 2% rise achieved ---
-        if rise_from_buy >= ContextInfo.BUY_CONTINUE and not ContextInfo.buy_rise_achieved:
-            ContextInfo.buy_rise_achieved = True
-            print('[rule2.4] 2%% rise achieved! Monitoring 0.5%% pullback...')
+        # --- Phase 1: 触发条件 -- 涨1.5% 或 (0.6%且10分钟) ---
+        if not ContextInfo.buy_rise_achieved:
+            if ContextInfo.trade_count >= 3:
+                # 第3笔起: 涨1.5% 或 (0.6%且10分钟)
+                if rise_from_buy >= ContextInfo.BUY_TRACK_TRIGGER:
+                    ContextInfo.buy_rise_achieved = True
+                    print('[rule2.4] 1.5% rise triggered! Monitoring 0.4% pullback...')
+                elif (rise_from_buy >= ContextInfo.BUY_CONTINUE_ALT and
+                      ContextInfo.bars_since_buy >= ContextInfo.CONTINUE_WAIT_BARS):
+                    ContextInfo.buy_rise_achieved = True
+                    print('[rule2.4] 0.6%+10min triggered! Monitoring 0.4% pullback...')
+            else:
+                # 前2笔: 涨2%
+                if rise_from_buy >= ContextInfo.BUY_CONTINUE:
+                    ContextInfo.buy_rise_achieved = True
+                    print('[rule2.4] 2% rise achieved! Monitoring 0.5% pullback...')
 
-        # --- Phase 2a: 2% rise achieved -> check 0.5% pullback (rule 2.4) ---
+        # --- Phase 2a: 触发后 -- 从新高回调0.4%卖出 ---
         if ContextInfo.buy_rise_achieved:
             pullback_from_high = (ContextInfo.peak_price - current_close) / ContextInfo.peak_price
             print('[rule2.4] rise=%.2f%% pullback=%.2f%% peak=%.3f' %
                   (rise_from_buy * 100, pullback_from_high * 100, ContextInfo.peak_price))
-            if pullback_from_high >= ContextInfo.RESELL_PULLBACK:
+            resell_thresh = ContextInfo.RESELL_THRESH if ContextInfo.trade_count >= 3 else ContextInfo.RESELL_PULLBACK
+            if pullback_from_high >= resell_thresh:
                 if do_sell(ContextInfo, ContextInfo.LOTS, current_close, date):
                     ContextInfo.sell_price = current_close
                     ContextInfo.buy_rise_achieved = False
                     ContextInfo.sell_drop_achieved = False
+                    ContextInfo.bars_since_sell = 0
                     ContextInfo.state = STATE_SOLD_TRACKING_LOW
                     ContextInfo.trough_price = current_low
                     ContextInfo.trade_count += 1
-                    print('[SELL rule2.4] 2%%+pullback0.5%%. resell: %.3f' % current_close)
+                    print('[SELL rule2.4] pullback>=%.1f%%. resell: %.3f' % (resell_thresh * 100, current_close))
 
-        # --- Phase 2b: stop-loss protection (only after 3rd trade) ---
+        # --- Phase 2b: 止损保护 (仅第3笔起) ---
         elif ContextInfo.trade_count >= 3 and current_close <= ContextInfo.buy_price * (1 - ContextInfo.PROTECTION_BUF):
             if do_sell(ContextInfo, ContextInfo.LOTS, current_close, date):
                 ContextInfo.sell_price = current_close
                 ContextInfo.buy_rise_achieved = False
                 ContextInfo.sell_drop_achieved = False
+                ContextInfo.bars_since_sell = 0
                 ContextInfo.state = STATE_SOLD_TRACKING_LOW
                 ContextInfo.trough_price = current_low
                 ContextInfo.trade_count += 1
