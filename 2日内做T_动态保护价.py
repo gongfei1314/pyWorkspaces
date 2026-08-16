@@ -19,6 +19,8 @@
   [Bug4] 持仓key兼容查找 get_holding_amount()
   [改进1] 每日最多2次完整循环（4笔交易）
   [改进2] 09:30起静默追踪日内极值; 09:45后才开始执行交易
+  [接口升级] 行情接口get_market_data -> get_market_data_ex;
+             init()用download_history_data补充昨日及以前历史数据
 '''
 
 # ============================================================
@@ -86,6 +88,13 @@ def init(ContextInfo):
     ContextInfo.bars_since_sell = 0              # 卖出后经过的K线数
     ContextInfo.bars_since_buy  = 0              # 买入后经过的K线数
 
+    # ---- 历史数据补充: 昨日及以前(供get_market_data_ex查询昨收价/历史K线) ----
+    try:
+        download_history_data(ContextInfo.TARGET_CODE, '1d', '20200101', '')          # 日线: 昨收价
+        download_history_data(ContextInfo.TARGET_CODE, ContextInfo.period, '', '')    # 本周期: 增量补充
+    except Exception as e:
+        print('[warn] 历史数据补充失败(可在客户端手动补充):', e)
+
     ContextInfo.set_universe([ContextInfo.TARGET_CODE])
 
 
@@ -99,14 +108,18 @@ def handlebar(ContextInfo):
           '| 交易笔数:', ContextInfo.trade_count, '/', ContextInfo.MAX_TRADES)
 
     # ---- 获取行情数据 ----
-    df = ContextInfo.get_market_data(
+    # [接口升级] get_market_data_ex: 返回 {股票代码: DataFrame}
+    data = ContextInfo.get_market_data_ex(
         ['open', 'high', 'low', 'close'],
         stock_code=ContextInfo.get_universe(),
         start_time=timetag_to_datetime(ContextInfo.get_bar_timetag(d - 1), '%Y%m%d%H%M%S'),
         end_time=timetag_to_datetime(ContextInfo.get_bar_timetag(d), '%Y%m%d%H%M%S'),
         period=ContextInfo.period
     )
-    if df.empty:
+    df = data.get(ContextInfo.TARGET_CODE) if data else None
+    if df is None and data:                     # 兜底: 返回key与代码格式不一致时取第一个
+        df = next(iter(data.values()))
+    if df is None or df.empty:
         return
 
     current_close = df.iloc[-1]['close']          # 当前收盘价
@@ -122,7 +135,11 @@ def handlebar(ContextInfo):
     # ============================================================
     current_date = date[:10]
     if ContextInfo.last_trade_date != current_date:
-        ContextInfo.prev_close = ContextInfo.last_bar_close
+        if ContextInfo.last_bar_close > 0:
+            ContextInfo.prev_close = ContextInfo.last_bar_close
+        else:
+            # 首次运行: 从已下载的历史日线获取真实昨收价
+            ContextInfo.prev_close = get_prev_close_from_history(ContextInfo, current_date)
         if ContextInfo.last_trade_date != '':
             print('========== 新交易日 %s: 状态重置 ==========' % current_date)
         ContextInfo.last_trade_date = current_date
@@ -517,6 +534,32 @@ def get_holding_amount(holding_dict, code):
             return val
 
     return 0
+
+
+def get_prev_close_from_history(ContextInfo, current_date):
+    """
+    [接口升级] 从本地已下载的日K线中, 获取 current_date 之前最近一个交易日的收盘价。
+    依赖 init() 中 download_history_data(..., '1d', ...) 补充的历史数据。
+    获取失败返回 0.0, 由调用方回退到当日开盘价作为参考价。
+    """
+    try:
+        data = ContextInfo.get_market_data_ex(
+            ['close'], [ContextInfo.TARGET_CODE],
+            start_time='20200101', end_time=current_date.replace('-', ''), period='1d'
+        )
+        df = data.get(ContextInfo.TARGET_CODE) if data else None
+        if df is None or df.empty:
+            return 0.0
+        today = current_date.replace('-', '')
+        rows = [(str(idx), row['close']) for idx, row in df.iterrows()]
+        prev = [(ts, c) for ts, c in rows if ts[:8] < today]
+        if not prev:
+            return 0.0
+        print('[昨收价] 取自历史日线 %s: %.3f' % (prev[-1][0][:8], float(prev[-1][1])))
+        return float(prev[-1][1])
+    except Exception as e:
+        print('[warn] 获取历史昨收价失败, 将回退到开盘价:', e)
+        return 0.0
 
 
 def get_avaliable(accountid, datatype):
