@@ -35,14 +35,14 @@ STATE_BOUGHT_TRACKING_HIGH = 'BOUGHT_TRACKING_HIGH' # 已买入, 追踪峰值待再卖
 
 def init(ContextInfo):
     # ---- 策略参数 ----
-    ContextInfo.LOTS          = 20000           # 每次做T股数
+    ContextInfo.LOTS          = 40000           # 每次做T股数
     ContextInfo.BASE_HOLDING  = 57700           # 底仓股数
     ContextInfo.TARGET_CODE   = '588170.SH'     # ETF代码
     ContextInfo.accountID     = '8890523082'
 
     # ---- 阈值参数 ----
-    ContextInfo.UP_TRIGGER      = 0.03           # 冲高+3%触发
-    ContextInfo.DOWN_TRIGGER    = 0.03           # 回落-3%触发
+    ContextInfo.UP_TRIGGER      = 0.028           # 冲高+3%触发 --2.8%收益更高
+    ContextInfo.DOWN_TRIGGER    = 0.028           # 回落-3%触发--2.8%收益更高
     ContextInfo.SELL_PULLBACK   = 0.012           # 规则2.1: 回撤1%卖出
     ContextInfo.BUY_BOUNCE      = 0.012           # 规则2.2: 反弹1%买入
     ContextInfo.SELL_CONTINUE   = 0.02          # 规则2.3: 继续下跌2%触发(旧)
@@ -61,7 +61,7 @@ def init(ContextInfo):
     ContextInfo.STOPLOSS_BUF_EARLY  = 0.012       # 止损保护(第一次买入后trade_count<3): 跌魄买入价1.2%
 
     # ---- 交易限制 ----
-    ContextInfo.MAX_TRADES      = 4              # 最多2次循环 × (1买+1卖) = 4笔
+    ContextInfo.MAX_TRADES      = 2              # 最多2次循环 × (1买+1卖) = 4笔  --改为2笔
     ContextInfo.START_TIME      = 945            # 09:45 策略激活
     ContextInfo.REBALANCE_TIME  = 1450           # 14:50 尾盘平仓
     ContextInfo.STOP_FLAT_TIME   = 1315           # 13:15 后持仓=底仓, 停止当日交易
